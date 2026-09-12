@@ -13,6 +13,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 120   # Gives the scraper up to 2 hours to process all pages
 
     steps:
       - name: Checkout repository
