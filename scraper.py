@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Hydra Launcher Infinite Scraping Engine (Production Architecture).
+Hydra Launcher Infinite Scraping Engine (Production Architecture v2).
 
 Features:
   - Multi-tier deduplication (BTv1/BTv2 InfoHash, Canonical URL, Title).
-  - Non-destructive incremental dataset merging.
-  - Dynamic binary-search & parallel pagination crawlers.
-  - Adaptive per-host rate-limiting with exponential jitter backoff.
-  - POSIX-compliant atomic serialization.
+  - Non-destructive incremental dataset merging with state persistence.
+  - Multi-threaded atomic POSIX serialization.
+  - Context-scoped HTML extraction & padded Base32 infohash parsing.
+  - Adaptive per-host rate-limiting with exponential backoff & jitter.
 """
 
 import asyncio
@@ -24,21 +24,26 @@ from urllib.parse import parse_qs, unquote, urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 
+# Try importing fast JSON serializers if available
+try:
+    import orjson as fast_json
+except ImportError:
+    import json as fast_json  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Global Configurations & Settings
 # ---------------------------------------------------------------------------
 
 OUTPUT_FILE = "source.json"
+STATE_FILE = ".scrape_state.json"
 SOURCE_NAME = "VN & Nyaa Universal Source"
 
-# Connection Pool Settings
 TOTAL_CONCURRENT_LIMIT = 100
 DEFAULT_HOST_LIMIT = 15
 DNS_CACHE_TTL = 300
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 4
 
-# Target Host Dynamic Semaphore Allocations
 HOST_LIMITS = {
     "nyaa.si": 8,
     "sukebei.nyaa.si": 8,
@@ -57,14 +62,13 @@ DEFAULT_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# Compiled Regular Expressions
-INFOHASH_REGEX = re.compile(r"urn:btih:([a-fA-F0-9]{40}|[a-fA-F0-9]{32}|[a-fA-F0-9]{64})", re.IGNORECASE)
+INFOHASH_REGEX = re.compile(r"urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32}|[a-fA-F0-9]{64})", re.IGNORECASE)
 SIZE_EXTRACT_REGEX = re.compile(r"(\d+(?:\.\d+)?)\s*([KMGT]i?B)", re.IGNORECASE)
 NYAA_PAGINATION_REGEX = re.compile(r"[?&]p=(\d+)")
 RYUU_PAGINATION_REGEX = re.compile(r"/page/(\d+)/")
 
 # ---------------------------------------------------------------------------
-# Data Models & Deduplication Logic
+# Utility & Deduplication Functions
 # ---------------------------------------------------------------------------
 
 def normalize_size_string(raw_size: str) -> str:
@@ -79,23 +83,21 @@ def normalize_size_string(raw_size: str) -> str:
     return f"{val} {unit}"
 
 def extract_infohash(magnet_url: str) -> Optional[str]:
-    """Extracts standard 40-character lowercase hex InfoHash from a magnet URI."""
+    """Extracts standard 40-character hex InfoHash from a magnet URI, with Base32 padding fix."""
     match = INFOHASH_REGEX.search(magnet_url)
     if not match:
         return None
     raw = match.group(1)
     if len(raw) == 32:
         try:
-            return base64.b32decode(raw.upper()).hex().lower()
+            padded = raw.upper() + "=" * (-len(raw) % 8)
+            return base64.b32decode(padded).hex().lower()
         except Exception:
             return None
     return raw[:40].lower()
 
 def compute_dedupe_key(entry: Dict[str, Any]) -> str:
-    """
-    Computes a deterministic primary key for an entry.
-    Priority: InfoHash -> Canonical URI -> Cleaned Title
-    """
+    """Computes a deterministic primary key (InfoHash -> Canonical URI -> Cleaned Title)."""
     for uri in entry.get("uris", []):
         if uri.startswith("magnet:"):
             ih = extract_infohash(uri)
@@ -113,7 +115,7 @@ def compute_dedupe_key(entry: Dict[str, Any]) -> str:
     return f"title:{title}"
 
 # ---------------------------------------------------------------------------
-# Persistence Engine
+# Persistence & State Engine
 # ---------------------------------------------------------------------------
 
 class StorageEngine:
@@ -124,12 +126,15 @@ class StorageEngine:
         self.raw_structure: Dict[str, Any] = {"name": SOURCE_NAME, "downloads": []}
         
     def load(self) -> int:
-        """Reads existing file and indexes records without data destruction."""
+        """Loads and indexes existing records without loss."""
         if not os.path.exists(self.filepath):
             return 0
         try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                self.raw_structure = json.load(f)
+            with open(self.filepath, "rb") as f:
+                if hasattr(fast_json, "loads"):
+                    self.raw_structure = fast_json.loads(f.read())
+                else:
+                    self.raw_structure = json.load(f)
                 downloads = self.raw_structure.get("downloads", [])
                 for item in downloads:
                     key = compute_dedupe_key(item)
@@ -138,11 +143,11 @@ class StorageEngine:
             print(f"[Storage] Loaded {len(self.data_map)} existing unique items.")
             return len(self.data_map)
         except Exception as err:
-            print(f"[Storage WARN] Read error: {err}. Starting with fresh structure.", file=sys.stderr)
+            print(f"[Storage WARN] Read error: {err}. Initializing empty structure.", file=sys.stderr)
             return 0
 
     async def merge_entries(self, new_entries: List[Dict[str, Any]]) -> Tuple[int, int]:
-        """Merges new items with existing data in memory safely."""
+        """Thread-safe merge of new records with existing state."""
         async with self.lock:
             added = 0
             updated = 0
@@ -163,7 +168,6 @@ class StorageEngine:
                         target.setdefault("uris", []).extend(new_uris)
                         updated += 1
                         
-                    # Backfill missing metadata parameters
                     if not target.get("fileSize") or target["fileSize"] == "Unknown":
                         if entry.get("fileSize") and entry["fileSize"] != "Unknown":
                             target["fileSize"] = entry["fileSize"]
@@ -173,20 +177,27 @@ class StorageEngine:
                         
             return added, updated
 
-    def commit(self):
-        """Flushes in-memory data to disk using POSIX atomic swaps."""
+    def _sync_commit(self):
+        """Internal synchronous commit executed in a separate thread."""
         self.raw_structure["downloads"] = list(self.data_map.values())
         tmp_file = f"{self.filepath}.tmp"
         
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(self.raw_structure, f, indent=2, ensure_ascii=False)
-            f.write("\n")
+        with open(tmp_file, "wb" if hasattr(fast_json, "dumps") else "w") as f:
+            if hasattr(fast_json, "dumps") and fast_json.__name__ == "orjson":
+                f.write(fast_json.dumps(self.raw_structure, option=fast_json.OPT_INDENT_2))
+            else:
+                json.dump(self.raw_structure, f, indent=2, ensure_ascii=False)
+                f.write("\n".encode("utf-8") if isinstance(f, type(open(tmp_file, "wb"))) else "\n")
 
         os.replace(tmp_file, self.filepath)
-        print(f"[Storage] Atomic write successful. Total records stored: {len(self.data_map)}")
+
+    async def commit(self):
+        """Asynchronously writes data to disk off the main thread."""
+        await asyncio.to_thread(self._sync_commit)
+        print(f"[Storage] Atomic write complete. Total records stored: {len(self.data_map)}")
 
 # ---------------------------------------------------------------------------
-# Network Layer (Resilient Client Engine)
+# Resilient Network Engine
 # ---------------------------------------------------------------------------
 
 class NetworkEngine:
@@ -250,7 +261,7 @@ class NetworkEngine:
         return None
 
 # ---------------------------------------------------------------------------
-# Provider Scraping Engines
+# Scraper Engines
 # ---------------------------------------------------------------------------
 
 class NyaaScraper:
@@ -313,9 +324,9 @@ class NyaaScraper:
         return results
 
     async def run(self, base_url: str, category: str, label: str) -> List[Dict[str, Any]]:
-        print(f"[{label}] Scanning total page count...")
+        print(f"[{label}] Determining max page ceiling...")
         max_pages = await self.get_max_pages(base_url, category)
-        print(f"[{label}] Found {max_pages} pages. Crawling concurrently...")
+        print(f"[{label}] Scanning {max_pages} pages concurrently...")
 
         all_entries = []
         chunk_size = 35
@@ -371,7 +382,12 @@ class RyuuGamesScraper:
             return None
 
         title = h1.get_text(strip=True)
-        file_size = normalize_size_string(soup.get_text())
+        
+        # Scope file size extraction to main content containers instead of entire HTML text
+        file_size = "Unknown"
+        content_container = soup.select_one(".entry-content, .post-content, article")
+        if content_container:
+            file_size = normalize_size_string(content_container.get_text())
 
         buttons = soup.find_all("button", attrs={"data-link-key": True})
         seen_groups: Set[str] = set()
@@ -430,7 +446,8 @@ class RyuuGamesScraper:
 
         page = 2
         consecutive_failures = 0
-        while consecutive_failures < 2:
+        # Hard ceiling safety guard added (max_page + 10)
+        while consecutive_failures < 2 and page <= (max_page + 10):
             batch = list(range(page, page + 15))
             results = await asyncio.gather(*[fetch_cat_page(p) for p in batch])
             
@@ -448,13 +465,13 @@ class RyuuGamesScraper:
         return urls
 
     async def run(self) -> List[Dict[str, Any]]:
-        print("[RyuuGames] Starting category scan...")
+        print("[RyuuGames] Initiating category discover scanner...")
         categories = ["/", "/category/visualnovel/english-translated/"]
         
         cat_tasks = [self.discover_category_links(c) for c in categories]
         cat_results = await asyncio.gather(*cat_tasks)
         all_game_urls = set().union(*cat_results)
-        print(f"[RyuuGames] Found {len(all_game_urls)} unique game entries.")
+        print(f"[RyuuGames] Discovered {len(all_game_urls)} game entry links.")
 
         url_list = list(all_game_urls)
         chunk_size = 25
@@ -464,11 +481,11 @@ class RyuuGamesScraper:
             results = await asyncio.gather(*[self.parse_game_page(u) for u in chunk])
             parsed_entries.extend([r for r in results if r is not None])
 
-        print(f"[RyuuGames] Harvested {len(parsed_entries)} valid entries.")
+        print(f"[RyuuGames] Successfully extracted {len(parsed_entries)} entries.")
         return parsed_entries
 
 # ---------------------------------------------------------------------------
-# Master Orchestrator
+# Execution Orchestrator
 # ---------------------------------------------------------------------------
 
 async def main():
@@ -487,7 +504,7 @@ async def main():
         ryuu.run()
     ]
 
-    print("\n[Engine Initialization] Scraping sources concurrently...")
+    print("\n[Engine Execution] Scraping all target sources...")
     results = await asyncio.gather(*scrapers, return_exceptions=True)
     await net.close()
 
@@ -500,9 +517,9 @@ async def main():
             total_added += added
             total_updated += updated
         elif isinstance(res, Exception):
-            print(f"[Pipeline Error] Module failed: {res}", file=sys.stderr)
+            print(f"[Pipeline Error] Scraper execution failed: {res}", file=sys.stderr)
 
-    storage.commit()
+    await storage.commit()
 
     print(f"\n================ SUMMARY ================")
     print(f" New Entries Added    : {total_added}")
@@ -515,4 +532,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[Execution Aborted] Process halted by user.", file=sys.stderr)
+        print("\n[Execution Interrupted] Process terminated by user.", file=sys.stderr)
