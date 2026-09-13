@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Hydra Launcher full custom source scraper.
+Hydra Launcher full custom source scraper (Incremental Updates).
 
-Scrapes ALL pages for:
-  1. Nyaa.si PC Games (https://nyaa.si/?c=6_2)
-  2. Sukebei Art - Games (https://sukebei.nyaa.si/?c=1_3)
+Scrapes pages for:
+  1. Nyaa.si PC Games
+  2. Sukebei Art - Games
   3. RyuuGames Visual Novels
 
-Outputs a Hydra Launcher-compatible source.json file.
+Outputs/Updates a Hydra Launcher-compatible source.json file without overwriting old entries.
 """
 
 import base64
 import json
+import os
 import re
 import sys
 import time
@@ -28,11 +29,10 @@ NYAA_BASE = "https://nyaa.si"
 SUKEBEI_BASE = "https://sukebei.nyaa.si"
 RYUUGAMES_BASE = "https://www.ryuugames.com"
 
-# Maximum pages to scrape per run (Increase or remove limit as needed)
-# Nyaa/Sukebei usually have ~100-300+ pages of games
-MAX_NYAA_PAGES = 50       
-MAX_SUKEBEI_PAGES = 50
-MAX_RYUU_GAMES = 150      
+# Maximum pages to scrape per run
+MAX_NYAA_PAGES = 500        
+MAX_SUKEBEI_PAGES = 500
+MAX_RYUU_PAGES = 1000      
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -51,7 +51,7 @@ OUTPUT_FILE = "source.json"
 
 def fetch_url(url):
     """Fetch a URL with timeout and delay to respect server limits."""
-    time.sleep(0.5)  # Delay between requests to avoid rate limits
+    time.sleep(0.5)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         resp.raise_for_status()
@@ -64,12 +64,37 @@ def normalize_size(size_str):
     size_str = size_str.strip()
     return re.sub(r"([KMGT])iB", r"\1B", size_str, flags=re.IGNORECASE)
 
+def load_existing_source(filepath):
+    """Loads existing JSON file and returns a map of {primary_uri: entry} for fast deduplication."""
+    if not os.path.exists(filepath):
+        return {}
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            existing_downloads = data.get("downloads", [])
+            
+            # Map each item by its first URI for unique tracking
+            existing_map = {}
+            for item in existing_downloads:
+                uris = item.get("uris", [])
+                if uris:
+                    existing_map[uris[0]] = item
+                elif item.get("title"):
+                    existing_map[item["title"]] = item
+            
+            print(f"[Storage] Loaded {len(existing_map)} existing entries from {filepath}.")
+            return existing_map
+    except Exception as exc:
+        print(f"[WARN] Could not parse existing {filepath}: {exc}. Starting fresh.", file=sys.stderr)
+        return {}
+
 # ---------------------------------------------------------------------------
-# Nyaa / Sukebei Web Scraper (All Pages)
+# Nyaa / Sukebei Web Scraper
 # ---------------------------------------------------------------------------
 
 def scrape_nyaa_site(base_url, category_param, source_label, max_pages):
-    print(f"[{source_label}] Starting full web scrape...")
+    print(f"[{source_label}] Starting web scrape...")
     entries = []
     
     for page in range(1, max_pages + 1):
@@ -88,19 +113,16 @@ def scrape_nyaa_site(base_url, category_param, source_label, max_pages):
             
         for row in rows:
             try:
-                # Extract Title & Link
                 title_links = row.select("td[colspan='2'] a:not(.comments)")
                 if not title_links:
                     continue
                 title = title_links[-1].get_text(strip=True)
                 
-                # Extract Magnet link
                 magnet_tag = row.find("a", href=re.compile(r"^magnet:"))
                 if not magnet_tag:
                     continue
                 magnet_link = magnet_tag["href"]
                 
-                # Extract Size & Date
                 tds = row.find_all("td")
                 file_size = normalize_size(tds[3].get_text(strip=True)) if len(tds) > 3 else "Unknown"
                 raw_date = tds[4].get_text(strip=True) if len(tds) > 4 else ""
@@ -119,24 +141,23 @@ def scrape_nyaa_site(base_url, category_param, source_label, max_pages):
                     "uploadDate": upload_date,
                     "uris": [magnet_link]
                 })
-            except Exception as exc:
+            except Exception:
                 continue
 
-    print(f"[{source_label}] Parsed {len(entries)} total entries.")
+    print(f"[{source_label}] Parsed {len(entries)} total entries in this run.")
     return entries
 
 # ---------------------------------------------------------------------------
 # RyuuGames HTML Scraper
 # ---------------------------------------------------------------------------
 
-def scrape_ryuugames():
-    print("[RyuuGames] Starting full scrape...")
+def scrape_ryuugames(max_pages):
+    print("[RyuuGames] Starting scrape...")
     game_urls = set()
 
-    # Step 1: Collect game page links across categories
     categories = ["/", "/category/visualnovel/english-translated"]
     for cat in categories:
-        for page in range(1, 15):
+        for page in range(1, max_pages + 1):
             url = f"{RYUUGAMES_BASE}{cat.rstrip('/')}/page/{page}/" if page > 1 else f"{RYUUGAMES_BASE}{cat}"
             html = fetch_url(url)
             if not html:
@@ -153,14 +174,13 @@ def scrape_ryuugames():
 
     print(f"[RyuuGames] Found {len(game_urls)} total game pages.")
     
-    # Step 2: Scrape each game page
     entries = []
-    for game_url in sorted(game_urls)[:MAX_RYUU_GAMES]:
+    for game_url in sorted(game_urls):
         entry = scrape_ryuugames_game_page(game_url)
         if entry:
             entries.append(entry)
 
-    print(f"[RyuuGames] Parsed {len(entries)} entries.")
+    print(f"[RyuuGames] Parsed {len(entries)} entries in this run.")
     return entries
 
 def fetch_ryuugames_download_url(game_page_url, link_key, post_id, shortcode_id):
@@ -201,7 +221,6 @@ def scrape_ryuugames_game_page(url):
     if not title:
         return None
 
-    # Size extraction
     file_size = "Unknown"
     size_match = re.search(r"(\d+(?:\.\d+)?)\s*(GiB|MiB|KiB|TiB|GB|MB|KB|TB)", soup.get_text(), re.I)
     if size_match:
@@ -239,30 +258,39 @@ def scrape_ryuugames_game_page(url):
 # ---------------------------------------------------------------------------
 
 def main():
-    all_downloads = []
+    # Load existing items to avoid duplicates
+    existing_entries_map = load_existing_source(OUTPUT_FILE)
+    initial_count = len(existing_entries_map)
 
-    # 1. Nyaa PC Games
-    nyaa_entries = scrape_nyaa_site(NYAA_BASE, "6_2", "Nyaa", MAX_NYAA_PAGES)
-    all_downloads.extend(nyaa_entries)
+    # Scrape fresh data
+    new_scrapes = []
+    new_scrapes.extend(scrape_nyaa_site(NYAA_BASE, "6_2", "Nyaa", MAX_NYAA_PAGES))
+    new_scrapes.extend(scrape_nyaa_site(SUKEBEI_BASE, "1_3", "Sukebei", MAX_SUKEBEI_PAGES))
+    new_scrapes.extend(scrape_ryuugames(MAX_RYUU_PAGES))
 
-    # 2. Sukebei Games
-    sukebei_entries = scrape_nyaa_site(SUKEBEI_BASE, "1_3", "Sukebei", MAX_SUKEBEI_PAGES)
-    all_downloads.extend(sukebei_entries)
+    # Merge new entries into existing entries map
+    added_count = 0
+    for entry in new_scrapes:
+        uris = entry.get("uris", [])
+        key = uris[0] if uris else entry.get("title")
+        
+        if key and key not in existing_entries_map:
+            existing_entries_map[key] = entry
+            added_count += 1
 
-    # 3. RyuuGames
-    ryuu_entries = scrape_ryuugames()
-    all_downloads.extend(ryuu_entries)
+    final_downloads = list(existing_entries_map.values())
 
     source = {
         "name": SOURCE_NAME,
-        "downloads": all_downloads,
+        "downloads": final_downloads,
     }
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(source, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
-    print(f"\nCompleted! Written {len(all_downloads)} total entries to {OUTPUT_FILE}")
+    print(f"\n[Completed] Added {added_count} new unique entries.")
+    print(f"[Completed] Total entries in {OUTPUT_FILE}: {len(final_downloads)} (Up from {initial_count})")
 
 if __name__ == "__main__":
     main()
